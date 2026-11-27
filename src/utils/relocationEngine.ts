@@ -1,6 +1,7 @@
 import type {
   BoxCoordinate,
   ImportedSpreadsheet,
+  LockedLocationInfo,
   PlacementRecord,
   PlacementValidationResult,
   RackConfig,
@@ -23,6 +24,9 @@ export function createInitialSimulationState(
     config,
     draftPlacements: [],
     savedRecords: [],
+    externalLockedLocations: [],
+    externalResultSourceName: null,
+    externalResultSourceType: null,
     nextSequence: 1,
     history: [],
     spreadsheet: null,
@@ -47,6 +51,35 @@ export function formatNewLocationCode(
 ): string {
   const cleanLoc = sanitizeLocationCode(locationCode);
   return `${cleanLoc}.${rack}.${row}.${box}`;
+}
+
+/**
+ * Parses a formatted new location code (e.g. "RC2.1.1.1") back into a BoxCoordinate.
+ * Returns null if the code does not match the LOKASI.RAK.ROW.BOX structure.
+ */
+export function parseNewLocationCode(code: string): BoxCoordinate | null {
+  const trimmed = code.trim();
+  const match = trimmed.match(/^([A-Za-z0-9_-]+)\.(\d+)\.(\d+)\.(\d+)$/);
+  if (!match) return null;
+  const rack = parseInt(match[2], 10);
+  const row = parseInt(match[3], 10);
+  const box = parseInt(match[4], 10);
+  if (
+    !Number.isFinite(rack) ||
+    !Number.isFinite(row) ||
+    !Number.isFinite(box) ||
+    rack < 1 ||
+    row < 1 ||
+    box < 1
+  ) {
+    return null;
+  }
+  return {
+    locationCode: sanitizeLocationCode(match[1]),
+    rack,
+    row,
+    box,
+  };
 }
 
 export function computeBoxNumber(
@@ -108,6 +141,218 @@ export function getAllTrackedPlacements(
   return combined;
 }
 
+/**
+ * Builds a unified lookup map of ALL locked (already-used) old location codes
+ * across active rack drafts, saved simulation records, and synced Google Sheets rows.
+ */
+export function getLockedLocationsMap(
+  state: SimulationState
+): Map<string, LockedLocationInfo> {
+  const map = new Map<string, LockedLocationInfo>();
+
+  // Lowest precedence: external Google Sheets or loaded result Excel rows
+  for (const ext of state.externalLockedLocations ?? []) {
+    const key = normalizeLocationCode(ext.oldLocation);
+    if (!key) continue;
+    const coord = ext.coordinate ?? parseNewLocationCode(ext.newLocation) ?? undefined;
+    map.set(key, {
+      ...ext,
+      normalizedKey: key,
+      coordinate: coord,
+      source: ext.source === 'external_file' ? 'external_file' : 'google_sheets',
+    });
+  }
+
+  // Local saved simulation records
+  for (const saved of state.savedRecords) {
+    const key = normalizeLocationCode(saved.oldLocation);
+    if (!key) continue;
+    map.set(key, {
+      oldLocation: saved.oldLocation,
+      normalizedKey: key,
+      newLocation: saved.newLocation,
+      source: 'saved',
+      coordinate: {
+        locationCode: saved.locationCode,
+        rack: saved.rack,
+        row: saved.row,
+        box: saved.box,
+      },
+    });
+  }
+
+  // Active rack draft placements
+  for (const draft of state.draftPlacements) {
+    const key = normalizeLocationCode(draft.oldLocation);
+    if (!key) continue;
+    map.set(key, {
+      oldLocation: draft.oldLocation,
+      normalizedKey: key,
+      newLocation: draft.newLocation,
+      source: draft.savedToExcel ? 'saved' : 'draft',
+      coordinate: {
+        locationCode: draft.locationCode,
+        rack: draft.rack,
+        row: draft.row,
+        box: draft.box,
+      },
+    });
+  }
+
+  return map;
+}
+
+/**
+ * Parses rows read from a connected Google Spreadsheet or result Excel file (FORMAT LAMA | FORMAT BARU)
+ * into LockedLocationInfo entries so codes already stored in the results spreadsheet are locked and counted.
+ */
+export function parseExternalSheetLocks(
+  rows: string[][],
+  source: 'google_sheets' | 'external_file' = 'google_sheets'
+): LockedLocationInfo[] {
+  if (!Array.isArray(rows) || rows.length === 0) return [];
+  const firstRow = rows[0] ?? [];
+
+  // Detect FORMAT LAMA and FORMAT BARU column indices dynamically if header row exists
+  let oldColIdx = 0;
+  let newColIdx = 1;
+  let hasHeader = false;
+
+  const detectedOld = firstRow.findIndex((cell) =>
+    /^(format\s*lama|lokasi\s*(simpan\s*)?lama|kode\s*lama)$/i.test(
+      String(cell ?? '').trim()
+    )
+  );
+  const detectedNew = firstRow.findIndex((cell) =>
+    /^(format\s*baru|lokasi\s*(simpan\s*)?baru|kode\s*baru)$/i.test(
+      String(cell ?? '').trim()
+    )
+  );
+
+  if (detectedOld >= 0 || detectedNew >= 0) {
+    hasHeader = true;
+    if (detectedOld >= 0) oldColIdx = detectedOld;
+    if (detectedNew >= 0) newColIdx = detectedNew;
+  }
+
+  const startIdx = hasHeader ? 1 : 0;
+  const seen = new Set<string>();
+  const locks: LockedLocationInfo[] = [];
+
+  for (let i = startIdx; i < rows.length; i++) {
+    const oldVal = String(rows[i]?.[oldColIdx] ?? '').trim();
+    const newVal = String(rows[i]?.[newColIdx] ?? '').trim();
+    if (!oldVal || !newVal) continue;
+    const key = normalizeLocationCode(oldVal);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    locks.push({
+      oldLocation: oldVal,
+      normalizedKey: key,
+      newLocation: newVal,
+      source,
+      coordinate: parseNewLocationCode(newVal) ?? undefined,
+    });
+  }
+
+  return locks;
+}
+
+/**
+ * Returns the unified, deduplicated Tabel Hasil list combining rows read from
+ * Google Sheets / loaded Excel result files with local savedRecords.
+ * Every row in Tabel Hasil is treated as already simulated (savedToExcel: true).
+ */
+export function getCombinedResultRecords(
+  state: SimulationState
+): PlacementRecord[] {
+  const externalList = state.externalLockedLocations ?? [];
+  const orderedSaved = [...state.savedRecords].sort(
+    (a, b) => a.sequence - b.sequence
+  );
+
+  if (externalList.length === 0) {
+    return orderedSaved;
+  }
+
+  const savedByKey = new Map<string, PlacementRecord>();
+  for (const saved of orderedSaved) {
+    savedByKey.set(normalizeLocationCode(saved.oldLocation), saved);
+  }
+
+  const combined: PlacementRecord[] = [];
+  const includedKeys = new Set<string>();
+  let seq = 1;
+
+  for (const ext of externalList) {
+    const key = normalizeLocationCode(ext.oldLocation);
+    if (!key || includedKeys.has(key)) continue;
+    includedKeys.add(key);
+
+    const localOverride = savedByKey.get(key);
+    if (localOverride) {
+      combined.push({
+        ...localOverride,
+        sequence: seq++,
+        savedToExcel: true,
+      });
+      continue;
+    }
+
+    const coord = ext.coordinate ?? parseNewLocationCode(ext.newLocation);
+    combined.push({
+      id: `ext-${key}`,
+      oldLocation: ext.oldLocation,
+      newLocation: ext.newLocation,
+      locationCode: coord?.locationCode ?? sanitizeLocationCode(state.config.prefix),
+      rack: coord?.rack ?? 0,
+      row: coord?.row ?? 0,
+      box: coord?.box ?? 0,
+      sequence: seq++,
+      placedAt: '',
+      savedToExcel: true,
+    });
+  }
+
+  for (const saved of orderedSaved) {
+    const key = normalizeLocationCode(saved.oldLocation);
+    if (includedKeys.has(key)) continue;
+    includedKeys.add(key);
+    combined.push({
+      ...saved,
+      sequence: seq++,
+      savedToExcel: true,
+    });
+  }
+
+  return combined;
+}
+
+/**
+ * Returns ALL simulated boxes across racks by unifying Tabel Hasil records
+ * (savedRecords + external Google Sheets/file results with valid coordinates)
+ * with active rack drafts. Any box already registered in Tabel Hasil is
+ * immediately reflected as simulated (savedToExcel: true) on the rack grid.
+ */
+export function getEffectiveRackPlacements(
+  state: SimulationState
+): PlacementRecord[] {
+  const byCoord = new Map<string, PlacementRecord>();
+
+  for (const record of getCombinedResultRecords(state)) {
+    if (record.rack < 1 || record.row < 1 || record.box < 1) continue;
+    const coordKey = `${sanitizeLocationCode(record.locationCode)}-${record.rack}-${record.row}-${record.box}`;
+    byCoord.set(coordKey, { ...record, savedToExcel: true });
+  }
+
+  for (const draft of state.draftPlacements) {
+    const coordKey = `${sanitizeLocationCode(draft.locationCode)}-${draft.rack}-${draft.row}-${draft.box}`;
+    byCoord.set(coordKey, draft);
+  }
+
+  return Array.from(byCoord.values());
+}
+
 export function findMatchingSpreadsheetItem(
   spreadsheet: ImportedSpreadsheet | null,
   input: string
@@ -121,26 +366,75 @@ export function findMatchingSpreadsheetItem(
 export function searchOldLocations(
   spreadsheet: ImportedSpreadsheet | null,
   query: string,
-  limit = 25
+  limit = 25,
+  options?: { excludeLockedKeys?: Set<string> }
 ): SpreadsheetItem[] {
   if (!spreadsheet) return [];
+  const excludeSet = options?.excludeLockedKeys;
   const trimmed = query.trim().toLowerCase();
+
+  const pool = excludeSet
+    ? spreadsheet.items.filter((item) => !excludeSet.has(item.normalizedKey))
+    : spreadsheet.items;
+
   if (!trimmed) {
-    return spreadsheet.items.slice(0, limit);
+    return pool.slice(0, limit);
   }
   const exactOrStarts: SpreadsheetItem[] = [];
-  const contains: SpreadsheetItem[] = [];
+  const containsCode: SpreadsheetItem[] = [];
+  const containsDesc: SpreadsheetItem[] = [];
+  const hasLetters = /[a-z]/i.test(trimmed);
 
-  for (const item of spreadsheet.items) {
+  for (const item of pool) {
     const val = item.oldLocation.toLowerCase();
+    const desc = (item.description ?? '').toLowerCase();
     if (val === trimmed || val.startsWith(trimmed)) {
       exactOrStarts.push(item);
     } else if (val.includes(trimmed)) {
-      contains.push(item);
+      containsCode.push(item);
+    } else if (desc && desc.includes(trimmed) && (hasLetters || trimmed.length >= 4)) {
+      containsDesc.push(item);
     }
   }
 
-  return [...exactOrStarts, ...contains].slice(0, limit);
+  return [...exactOrStarts, ...containsCode, ...containsDesc].slice(0, limit);
+}
+
+export function searchOldLocationsWithLockStatus(
+  spreadsheet: ImportedSpreadsheet | null,
+  lockedMap: Map<string, LockedLocationInfo>,
+  query: string,
+  options?: { hideLocked?: boolean; limit?: number }
+): {
+  visibleItems: SpreadsheetItem[];
+  matchedLockedItems: Array<{ item: SpreadsheetItem; lock: LockedLocationInfo }>;
+} {
+  if (!spreadsheet) {
+    return { visibleItems: [], matchedLockedItems: [] };
+  }
+  const limit = options?.limit ?? 12;
+  const hideLocked = options?.hideLocked ?? true;
+
+  const allMatches = searchOldLocations(spreadsheet, query, Math.max(limit * 3, 40));
+  const matchedLockedItems: Array<{
+    item: SpreadsheetItem;
+    lock: LockedLocationInfo;
+  }> = [];
+  const visibleItems: SpreadsheetItem[] = [];
+
+  for (const item of allMatches) {
+    const lock = lockedMap.get(item.normalizedKey);
+    if (lock) {
+      matchedLockedItems.push({ item, lock });
+      if (!hideLocked && visibleItems.length < limit) {
+        visibleItems.push(item);
+      }
+    } else if (visibleItems.length < limit) {
+      visibleItems.push(item);
+    }
+  }
+
+  return { visibleItems, matchedLockedItems };
 }
 
 export function validatePlacementInput(
@@ -170,7 +464,8 @@ export function validatePlacementInput(
     }
   }
 
-  const currentInBox = getPlacementByCoordinate(state.draftPlacements, coord);
+  const effectivePlacements = getEffectiveRackPlacements(state);
+  const currentInBox = getPlacementByCoordinate(effectivePlacements, coord);
   const existingInDraft = getPlacementByOldLocation(
     state.draftPlacements,
     resolvedOldLocation
@@ -199,25 +494,80 @@ export function validatePlacementInput(
 
     return {
       status: 'duplicate_old_location',
-      message: `Lokasi simpan lama "${resolvedOldLocation}" sudah ditempatkan pada ${formatBoxAddress(existingInDraft)} (${existingInDraft.newLocation}).`,
+      message: `Kode "${resolvedOldLocation}" terkunci karena sudah ditempatkan pada ${formatBoxAddress(existingInDraft)} (${existingInDraft.newLocation}).`,
       existingPlacement: existingInDraft,
+      lockedNewLocation: existingInDraft.newLocation,
       inSavedExcel: Boolean(existingInDraft.savedToExcel),
     };
   }
 
   if (existingInSaved) {
+    const isSameBox =
+      sanitizeLocationCode(existingInSaved.locationCode) === cleanCoordLoc &&
+      existingInSaved.rack === coord.rack &&
+      existingInSaved.row === coord.row &&
+      existingInSaved.box === coord.box;
+
+    if (isSameBox) {
+      return {
+        status: 'same_value_in_box',
+        message: `Lokasi simpan lama "${resolvedOldLocation}" sudah tersimulasi & terdaftar di Tabel Hasil pada box ini (${existingInSaved.newLocation}).`,
+        existingPlacement: existingInSaved,
+      };
+    }
+
     return {
       status: 'duplicate_old_location',
-      message: `Lokasi simpan lama "${resolvedOldLocation}" sudah tersimpan di Excel pada ${formatBoxAddress(existingInSaved)} (${existingInSaved.newLocation}).`,
+      message: `Kode "${resolvedOldLocation}" terkunci karena telah digunakan menjadi lokasi baru ${existingInSaved.newLocation} (${formatBoxAddress(existingInSaved)}).`,
       existingPlacement: existingInSaved,
+      lockedNewLocation: existingInSaved.newLocation,
       inSavedExcel: true,
     };
   }
 
+  const normalizedKey = normalizeLocationCode(resolvedOldLocation);
+  const existingInExternal = (state.externalLockedLocations ?? []).find(
+    (item) => normalizeLocationCode(item.oldLocation) === normalizedKey
+  );
+  if (existingInExternal) {
+    const extCoord =
+      existingInExternal.coordinate ??
+      parseNewLocationCode(existingInExternal.newLocation);
+    const isSameBox =
+      extCoord !== null &&
+      sanitizeLocationCode(extCoord.locationCode) === cleanCoordLoc &&
+      extCoord.rack === coord.rack &&
+      extCoord.row === coord.row &&
+      extCoord.box === coord.box;
+
+    if (isSameBox && currentInBox) {
+      return {
+        status: 'same_value_in_box',
+        message: `Lokasi simpan lama "${resolvedOldLocation}" sudah tersimulasi & terdaftar di Tabel Hasil pada box ini (${existingInExternal.newLocation}).`,
+        existingPlacement: currentInBox,
+      };
+    }
+
+    const sourceText =
+      existingInExternal.source === 'external_file'
+        ? 'file Spreadsheet Hasil'
+        : 'Google Sheets';
+    return {
+      status: 'duplicate_old_location',
+      message: `Kode "${resolvedOldLocation}" terkunci karena telah terdaftar pada ${sourceText} menjadi lokasi baru ${existingInExternal.newLocation}.`,
+      lockedNewLocation: existingInExternal.newLocation,
+      inSavedExcel: true,
+      inGoogleSheets: true,
+    };
+  }
+
   if (currentInBox) {
+    const statusDesc = currentInBox.savedToExcel
+      ? 'sudah tersimulasi & terdaftar di Tabel Hasil'
+      : 'saat ini terisi';
     return {
       status: 'needs_replace_confirmation',
-      message: `Box ${currentInBox.newLocation} saat ini terisi oleh lokasi lama "${currentInBox.oldLocation}". Yakin ingin menggantinya dengan "${resolvedOldLocation}"?`,
+      message: `Box ${currentInBox.newLocation} ${statusDesc} oleh lokasi lama "${currentInBox.oldLocation}". Yakin ingin menggantinya dengan "${resolvedOldLocation}"?`,
       currentPlacement: currentInBox,
       normalizedOldLocation: resolvedOldLocation,
     };
@@ -278,20 +628,29 @@ export function applyPlacement(
 
   if (validation.status === 'needs_replace_confirmation') {
     const existing = validation.currentPlacement;
+    const isExternalEntry = existing.id.startsWith('ext-');
+    const inDrafts = state.draftPlacements.some((p) => p.id === existing.id);
+    const inSaved = state.savedRecords.some((p) => p.id === existing.id);
+
     const updatedRecord: PlacementRecord = {
       ...existing,
+      id: isExternalEntry
+        ? `${cleanLoc}-${coord.rack}-${coord.row}-${coord.box}-${state.nextSequence}`
+        : existing.id,
       oldLocation: finalOldLocation,
       locationCode: cleanLoc,
       newLocation,
       placedAt,
-      savedToExcel: false,
+      savedToExcel: inSaved,
     };
-    const nextDrafts = state.draftPlacements.map((p) =>
-      p.id === existing.id ? updatedRecord : p
-    );
-    // If the old draft was already committed to savedRecords with the same id, update it or leave saved intact?
-    // Keep savedRecords synchronized if this exact id was already saved in this cycle!
-    const nextSaved = existing.savedToExcel
+
+    const nextDrafts = inDrafts
+      ? state.draftPlacements.map((p) =>
+          p.id === existing.id ? updatedRecord : p
+        )
+      : [...state.draftPlacements, updatedRecord];
+
+    const nextSaved = inSaved
       ? state.savedRecords.map((p) =>
           p.id === existing.id
             ? { ...updatedRecord, savedToExcel: true }
@@ -299,17 +658,18 @@ export function applyPlacement(
         )
       : state.savedRecords;
 
-    const finalDrafts = existing.savedToExcel
-      ? nextDrafts.map((p) =>
-          p.id === existing.id ? { ...updatedRecord, savedToExcel: true } : p
-        )
-      : nextDrafts;
+    const existingKey = normalizeLocationCode(existing.oldLocation);
+    const nextExternal = (state.externalLockedLocations ?? []).filter(
+      (ext) => normalizeLocationCode(ext.oldLocation) !== existingKey
+    );
 
     return {
       nextState: {
         ...state,
-        draftPlacements: finalDrafts,
+        draftPlacements: nextDrafts,
         savedRecords: nextSaved,
+        externalLockedLocations: nextExternal,
+        nextSequence: isExternalEntry ? state.nextSequence + 1 : state.nextSequence,
         history: nextHistory,
       },
       result: { status: 'placed', record: updatedRecord },
@@ -408,7 +768,12 @@ export function resetActiveRackSimulation(
 export function clearSavedExcelRecords(
   state: SimulationState
 ): SimulationState {
-  if (state.savedRecords.length === 0) return state;
+  if (
+    state.savedRecords.length === 0 &&
+    (state.externalLockedLocations ?? []).length === 0
+  ) {
+    return state;
+  }
   const nextDrafts = state.draftPlacements.map((d) => ({
     ...d,
     savedToExcel: false,
@@ -417,6 +782,9 @@ export function clearSavedExcelRecords(
     ...state,
     draftPlacements: nextDrafts,
     savedRecords: [],
+    externalLockedLocations: [],
+    externalResultSourceName: null,
+    externalResultSourceType: null,
     history: pushHistory(state),
   };
 }
@@ -434,17 +802,81 @@ export function removeDraftByCoordinate(
   };
 }
 
+/**
+ * Removes any placement occupying the given box coordinate across active drafts,
+ * local savedRecords, and external results (Tabel Hasil), freeing both the box
+ * and the old location code.
+ */
+export function removePlacementByCoordinate(
+  state: SimulationState,
+  coord: BoxCoordinate
+): SimulationState {
+  const cleanLoc = sanitizeLocationCode(coord.locationCode);
+  const matchesCoord = (p: {
+    locationCode: string;
+    rack: number;
+    row: number;
+    box: number;
+  }) =>
+    sanitizeLocationCode(p.locationCode) === cleanLoc &&
+    p.rack === coord.rack &&
+    p.row === coord.row &&
+    p.box === coord.box;
+
+  const nextDrafts = state.draftPlacements.filter((p) => !matchesCoord(p));
+  const nextSaved = state.savedRecords.filter((p) => !matchesCoord(p));
+  const nextExternal = (state.externalLockedLocations ?? []).filter((ext) => {
+    const extCoord = ext.coordinate ?? parseNewLocationCode(ext.newLocation);
+    return !extCoord || !matchesCoord(extCoord);
+  });
+
+  if (
+    nextDrafts.length === state.draftPlacements.length &&
+    nextSaved.length === state.savedRecords.length &&
+    nextExternal.length === (state.externalLockedLocations ?? []).length
+  ) {
+    return state;
+  }
+
+  return {
+    ...state,
+    draftPlacements: nextDrafts,
+    savedRecords: nextSaved,
+    externalLockedLocations: nextExternal,
+    history: pushHistory(state),
+  };
+}
+
 export function removeSavedRecordById(
   state: SimulationState,
   placementId: string
 ): SimulationState {
-  const exists = state.savedRecords.some((p) => p.id === placementId);
-  if (!exists) return state;
+  if (placementId.startsWith('ext-')) {
+    const targetKey = placementId.slice(4);
+    const nextExternal = (state.externalLockedLocations ?? []).filter(
+      (ext) => normalizeLocationCode(ext.oldLocation) !== targetKey
+    );
+    if (nextExternal.length === (state.externalLockedLocations ?? []).length) {
+      return state;
+    }
+    return {
+      ...state,
+      externalLockedLocations: nextExternal,
+      history: pushHistory(state),
+    };
+  }
+
+  const target = state.savedRecords.find((p) => p.id === placementId);
+  if (!target) return state;
+  const targetKey = normalizeLocationCode(target.oldLocation);
 
   return {
     ...state,
     savedRecords: state.savedRecords.filter((p) => p.id !== placementId),
     draftPlacements: state.draftPlacements.filter((p) => p.id !== placementId),
+    externalLockedLocations: (state.externalLockedLocations ?? []).filter(
+      (ext) => normalizeLocationCode(ext.oldLocation) !== targetKey
+    ),
     history: pushHistory(state),
   };
 }
@@ -535,46 +967,114 @@ export function calculateSimulationMetrics(
   const cleanLoc = sanitizeLocationCode(activeLocationCode);
   const rackTotalBoxes = state.config.rowsPerRack * state.config.boxesPerRow;
 
-  const activeRackDrafts = state.draftPlacements.filter(
+  const effectiveRackPlacements = getEffectiveRackPlacements(state);
+  const activeRackFilledList = effectiveRackPlacements.filter(
     (p) =>
       sanitizeLocationCode(p.locationCode) === cleanLoc &&
       p.rack === activeRack
   );
 
-  const rackFilledBoxes = activeRackDrafts.length;
+  const rackFilledBoxes = activeRackFilledList.length;
   const rackEmptyBoxes = Math.max(0, rackTotalBoxes - rackFilledBoxes);
   const unsavedDraftCount = state.draftPlacements.filter(
     (p) => !p.savedToExcel
   ).length;
   const savedExcelCount = state.savedRecords.length;
 
+  // Deduplicated set of old location keys committed in Spreadsheet Hasil (Google Sheets / result Excel + local savedRecords)
+  const registeredResultKeys = new Set<string>();
+  const externalKeys = new Set<string>();
+  for (const ext of state.externalLockedLocations ?? []) {
+    const key = normalizeLocationCode(ext.oldLocation);
+    if (!key) continue;
+    externalKeys.add(key);
+    registeredResultKeys.add(key);
+  }
+  for (const saved of state.savedRecords) {
+    const key = normalizeLocationCode(saved.oldLocation);
+    if (!key) continue;
+    registeredResultKeys.add(key);
+  }
+
+  // Active draft keys not yet committed into Spreadsheet Hasil
+  const draftOnlyKeys = new Set<string>();
+  for (const draft of state.draftPlacements) {
+    const key = normalizeLocationCode(draft.oldLocation);
+    if (!key) continue;
+    if (!registeredResultKeys.has(key)) {
+      draftOnlyKeys.add(key);
+    }
+  }
+
   const allTracked = getAllTrackedPlacements(state);
-  const totalRelocatedCount = allTracked.length;
+  const lockedMap = getLockedLocationsMap(state);
+  const totalRelocatedCount = Math.max(lockedMap.size, allTracked.length);
+  const spreadsheetResultsTotal = registeredResultKeys.size;
+  const externalResultsCount = externalKeys.size;
 
   if (state.spreadsheet && state.spreadsheet.items.length > 0) {
-    const spreadsheetKeys = new Set(
-      state.spreadsheet.items.map((item) => item.normalizedKey)
+    const templateKeys = new Set<string>();
+    let templateRegisteredCount = 0;
+    let templateDraftOnlyCount = 0;
+
+    for (const item of state.spreadsheet.items) {
+      templateKeys.add(item.normalizedKey);
+      if (registeredResultKeys.has(item.normalizedKey)) {
+        templateRegisteredCount += 1;
+      } else if (draftOnlyKeys.has(item.normalizedKey)) {
+        templateDraftOnlyCount += 1;
+      }
+    }
+
+    let unmatchedResultCount = 0;
+    for (const key of registeredResultKeys) {
+      if (!templateKeys.has(key)) {
+        unmatchedResultCount += 1;
+      }
+    }
+
+    const templateTotal = state.spreadsheet.items.length;
+    const templateSimulatedCount =
+      templateRegisteredCount + templateDraftOnlyCount;
+    const templateRemainingCount = Math.max(
+      0,
+      templateTotal - templateSimulatedCount
     );
-    const matchedRelocated = allTracked.filter((p) =>
-      spreadsheetKeys.has(normalizeLocationCode(p.oldLocation))
-    ).length;
-    const spreadsheetTotal = state.spreadsheet.items.length;
-    const spreadsheetRemaining = Math.max(0, spreadsheetTotal - matchedRelocated);
+
+    const registeredProgressPercent = Math.min(
+      100,
+      Math.round((templateRegisteredCount / templateTotal) * 100)
+    );
     const progressPercent = Math.min(
       100,
-      Math.round((matchedRelocated / spreadsheetTotal) * 100)
+      Math.round((templateSimulatedCount / templateTotal) * 100)
     );
+    const draftProgressPercent = Math.max(
+      0,
+      progressPercent - registeredProgressPercent
+    );
+
     return {
       rackTotalBoxes,
       rackFilledBoxes,
       rackEmptyBoxes,
       unsavedDraftCount,
       savedExcelCount,
+      spreadsheetResultsTotal,
+      externalResultsCount,
       totalRelocatedCount,
-      spreadsheetTotal,
-      spreadsheetRemaining,
+      templateTotal,
+      templateRegisteredCount,
+      templateDraftOnlyCount,
+      templateSimulatedCount,
+      templateRemainingCount,
+      unmatchedResultCount,
+      spreadsheetTotal: templateTotal,
+      spreadsheetRemaining: templateRemainingCount,
+      registeredProgressPercent,
+      draftProgressPercent,
       progressPercent,
-      progressLabel: `${matchedRelocated} dari ${spreadsheetTotal} data spreadsheet`,
+      progressLabel: `${templateSimulatedCount} dari ${templateTotal} kode template`,
     };
   }
 
@@ -589,9 +1089,19 @@ export function calculateSimulationMetrics(
     rackEmptyBoxes,
     unsavedDraftCount,
     savedExcelCount,
+    spreadsheetResultsTotal,
+    externalResultsCount,
     totalRelocatedCount,
+    templateTotal: null,
+    templateRegisteredCount: null,
+    templateDraftOnlyCount: null,
+    templateSimulatedCount: null,
+    templateRemainingCount: null,
+    unmatchedResultCount: 0,
     spreadsheetTotal: null,
     spreadsheetRemaining: null,
+    registeredProgressPercent: 0,
+    draftProgressPercent: progressPercent,
     progressPercent,
     progressLabel: `${rackFilledBoxes} dari ${rackTotalBoxes} box rak aktif`,
   };

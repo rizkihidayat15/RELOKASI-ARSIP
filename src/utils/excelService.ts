@@ -1,9 +1,14 @@
 import * as XLSX from 'xlsx';
-import type { ImportedSpreadsheet, PlacementRecord } from '../types/archive';
+import type {
+  ImportedSpreadsheet,
+  LockedLocationInfo,
+  PlacementRecord,
+} from '../types/archive';
 import {
   buildExcelExportRows,
   detectBestLocationColumn,
   extractSpreadsheetItems,
+  parseExternalSheetLocks,
 } from './relocationEngine';
 
 export const EXPORT_EXCEL_FILENAME = 'HASIL_LOKASI_SIMPAN_LAMA_DAN_BARU.xlsx';
@@ -102,6 +107,41 @@ export async function parseSpreadsheetFile(
   };
 }
 
+export async function parseResultSpreadsheetFile(file: File): Promise<{
+  fileName: string;
+  sheetName: string;
+  locks: LockedLocationInfo[];
+}> {
+  const buffer = await file.arrayBuffer();
+  const workbook = XLSX.read(buffer, { type: 'array' });
+  const sheetName = workbook.SheetNames[0];
+  if (!sheetName) {
+    throw new Error('File hasil relokasi tidak memiliki lembar kerja (sheet).');
+  }
+  const worksheet = workbook.Sheets[sheetName];
+  const matrix = XLSX.utils.sheet_to_json<(string | number | boolean | null)[]>(
+    worksheet,
+    { header: 1, defval: '' }
+  );
+
+  const stringRows: string[][] = matrix.map((row) =>
+    row.map((cell) => String(cell ?? '').trim())
+  );
+  const locks = parseExternalSheetLocks(stringRows, 'external_file');
+
+  if (locks.length === 0) {
+    throw new Error(
+      'Tidak ditemukan pasangan data FORMAT LAMA dan FORMAT BARU yang valid pada file hasil relokasi ini.'
+    );
+  }
+
+  return {
+    fileName: file.name,
+    sheetName,
+    locks,
+  };
+}
+
 export function generateRelocationExcelArtifact(
   placements: PlacementRecord[],
   includeExtraColumns: boolean
@@ -183,4 +223,97 @@ export function downloadSpreadsheetTemplate(): void {
   anchor.click();
   document.body.removeChild(anchor);
   setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+export function downloadUpdatedTemplateExcel(
+  spreadsheet: ImportedSpreadsheet
+): void {
+  const rows = spreadsheet.items.map((item) => ({
+    'LOKASI SIMPAN LAMA': item.oldLocation,
+    KETERANGAN: item.description ?? '',
+  }));
+  const worksheet = XLSX.utils.json_to_sheet(rows, {
+    header: ['LOKASI SIMPAN LAMA', 'KETERANGAN'],
+  });
+  worksheet['!cols'] = [{ wch: 24 }, { wch: 36 }];
+  const workbook = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(
+    workbook,
+    worksheet,
+    spreadsheet.sheetName?.slice(0, 31) || 'DATA_LOKASI_LAMA'
+  );
+  const buffer = XLSX.write(workbook, {
+    bookType: 'xlsx',
+    type: 'array',
+  }) as ArrayBuffer;
+  const blob = new Blob([buffer], {
+    type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  });
+  const baseName = spreadsheet.fileName
+    .replace(/\.(xlsx|xls|csv)$/i, '')
+    .trim();
+  const fileName = `${baseName || 'TEMPLATE_LOKASI_SIMPAN_LAMA'}.xlsx`;
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement('a');
+  anchor.href = url;
+  anchor.download = fileName;
+  document.body.appendChild(anchor);
+  anchor.click();
+  document.body.removeChild(anchor);
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+function formatBackupTimestampSlug(isoDate: string): string {
+  const d = new Date(isoDate);
+  if (Number.isNaN(d.getTime())) return 'BACKUP';
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}_${pad(d.getHours())}${pad(d.getMinutes())}`;
+}
+
+export function downloadTemplateBackupExcel(
+  rows: Record<string, string>[],
+  createdAt: string,
+  suffix = 'TEMPLATE'
+): void {
+  const worksheet = XLSX.utils.json_to_sheet(rows, {
+    header: [
+      'LOKASI SIMPAN LAMA',
+      'KETERANGAN',
+      'STATUS',
+      'LOKASI SIMPAN BARU',
+    ],
+  });
+  worksheet['!cols'] = [{ wch: 22 }, { wch: 28 }, { wch: 26 }, { wch: 22 }];
+  const workbook = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(workbook, worksheet, 'CADANGAN_TEMPLATE');
+  const buffer = XLSX.write(workbook, {
+    bookType: 'xlsx',
+    type: 'array',
+  }) as ArrayBuffer;
+  const blob = new Blob([buffer], {
+    type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement('a');
+  anchor.href = url;
+  anchor.download = `CADANGAN_${suffix}_${formatBackupTimestampSlug(createdAt)}.xlsx`;
+  document.body.appendChild(anchor);
+  anchor.click();
+  document.body.removeChild(anchor);
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+export function downloadResultBackupExcel(
+  records: PlacementRecord[],
+  includeExtraColumns: boolean,
+  createdAt: string
+): void {
+  const artifact = generateRelocationExcelArtifact(
+    records,
+    includeExtraColumns
+  );
+  downloadExcelArtifact({
+    ...artifact,
+    fileName: `CADANGAN_HASIL_${formatBackupTimestampSlug(createdAt)}.xlsx`,
+  });
 }

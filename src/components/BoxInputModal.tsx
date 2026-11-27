@@ -5,6 +5,8 @@ import {
   ArrowRight,
   Check,
   FileSpreadsheet,
+  Lock,
+  Plus,
   Search,
   Trash2,
   X,
@@ -18,12 +20,13 @@ import type {
 import {
   formatBoxAddress,
   formatNewLocationCode,
-  getAllTrackedPlacements,
+  getEffectiveRackPlacements,
+  getLockedLocationsMap,
   getPlacementByCoordinate,
   getPlacementByOldLocation,
   normalizeLocationCode,
   sanitizeLocationCode,
-  searchOldLocations,
+  searchOldLocationsWithLockStatus,
   validatePlacementInput,
 } from '../utils/relocationEngine';
 
@@ -39,6 +42,7 @@ interface BoxInputModalProps {
   onRemovePlacement: (coord: BoxCoordinate) => void;
   onJumpToBox: (coord: BoxCoordinate) => void;
   onOpenSpreadsheetTab: () => void;
+  onQuickAddToTemplate?: (oldLocation: string) => void;
 }
 
 export const BoxInputModal: React.FC<BoxInputModalProps> = ({
@@ -49,10 +53,12 @@ export const BoxInputModal: React.FC<BoxInputModalProps> = ({
   onRemovePlacement,
   onJumpToBox,
   onOpenSpreadsheetTab,
+  onQuickAddToTemplate,
 }) => {
   const [inputValue, setInputValue] = useState('');
   const [boxNumberInput, setBoxNumberInput] = useState('');
   const [showSuggestions, setShowSuggestions] = useState(false);
+  const [showLockedInSearch, setShowLockedInSearch] = useState(false);
   const [activeSuggestionIdx, setActiveSuggestionIdx] = useState(0);
   const [pendingReplaceConfirm, setPendingReplaceConfirm] = useState<string | null>(
     null
@@ -71,10 +77,18 @@ export const BoxInputModal: React.FC<BoxInputModalProps> = ({
     };
   }, [coordinate, boxNumberInput]);
 
+  const effectiveRackPlacements = useMemo(
+    () => getEffectiveRackPlacements(state),
+    [state]
+  );
+
   const currentPlacement: PlacementRecord | undefined = useMemo(() => {
     if (!effectiveCoordinate) return undefined;
-    return getPlacementByCoordinate(state.draftPlacements, effectiveCoordinate);
-  }, [effectiveCoordinate, state.draftPlacements]);
+    return getPlacementByCoordinate(
+      effectiveRackPlacements,
+      effectiveCoordinate
+    );
+  }, [effectiveCoordinate, effectiveRackPlacements]);
 
   const newLocationCode = useMemo(() => {
     if (!effectiveCoordinate) return '';
@@ -113,18 +127,26 @@ export const BoxInputModal: React.FC<BoxInputModalProps> = ({
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [coordinate, onClose]);
 
-  const suggestions: SpreadsheetItem[] = useMemo(() => {
-    if (!state.spreadsheet) return [];
-    return searchOldLocations(state.spreadsheet, inputValue, 12);
-  }, [state.spreadsheet, inputValue]);
+  const lockedLookup = useMemo(() => getLockedLocationsMap(state), [state]);
 
-  const placedLookup = useMemo(() => {
-    const map = new Map<string, PlacementRecord>();
-    for (const p of getAllTrackedPlacements(state)) {
-      map.set(normalizeLocationCode(p.oldLocation), p);
+  const { visibleItems: suggestions, matchedLockedItems } = useMemo(() => {
+    if (!state.spreadsheet) {
+      return { visibleItems: [], matchedLockedItems: [] };
     }
-    return map;
-  }, [state]);
+    return searchOldLocationsWithLockStatus(
+      state.spreadsheet,
+      lockedLookup,
+      inputValue,
+      { hideLocked: !showLockedInSearch, limit: 12 }
+    );
+  }, [state.spreadsheet, lockedLookup, inputValue, showLockedInSearch]);
+
+  const totalLockedInTemplate = useMemo(() => {
+    if (!state.spreadsheet) return 0;
+    return state.spreadsheet.items.filter((item) =>
+      lockedLookup.has(item.normalizedKey)
+    ).length;
+  }, [state.spreadsheet, lockedLookup]);
 
   const liveValidation = useMemo(() => {
     if (!effectiveCoordinate) return null;
@@ -135,6 +157,7 @@ export const BoxInputModal: React.FC<BoxInputModalProps> = ({
   if (!effectiveCoordinate) return null;
 
   const handleSelectSuggestion = (item: SpreadsheetItem) => {
+    if (lockedLookup.has(item.normalizedKey)) return;
     setInputValue(item.oldLocation);
     setPendingReplaceConfirm(null);
     setSubmitAttempted(false);
@@ -208,10 +231,17 @@ export const BoxInputModal: React.FC<BoxInputModalProps> = ({
     }
   };
 
+  const showLockedOnlyNotice =
+    Boolean(state.spreadsheet) &&
+    inputValue.trim().length > 0 &&
+    suggestions.length === 0 &&
+    matchedLockedItems.length > 0;
+
   const showNotFoundNotice =
     Boolean(state.spreadsheet) &&
     inputValue.trim().length > 0 &&
-    suggestions.length === 0;
+    suggestions.length === 0 &&
+    matchedLockedItems.length === 0;
 
   return (
     <div
@@ -314,7 +344,9 @@ export const BoxInputModal: React.FC<BoxInputModalProps> = ({
             <div className="mb-4 flex flex-wrap items-center justify-between gap-3 rounded-lg border border-emerald-200 bg-emerald-50/70 px-4 py-3">
               <div className="min-w-0">
                 <p className="text-xs font-medium text-emerald-900">
-                  Box ini sudah terisi oleh lokasi simpan lama:
+                  {currentPlacement.savedToExcel
+                    ? 'Box ini sudah tersimulasi & terdaftar di Tabel Hasil:'
+                    : 'Box ini sudah terisi (draft rak aktif):'}
                 </p>
                 <p className="mt-0.5 font-mono text-sm font-bold text-emerald-950 tabular-nums">
                   {currentPlacement.oldLocation}
@@ -395,7 +427,7 @@ export const BoxInputModal: React.FC<BoxInputModalProps> = ({
                 onKeyDown={handleInputKeyDown}
                 placeholder={
                   state.spreadsheet
-                    ? 'Ketik kode atau angka lokasi lama dari spreadsheet (mis. 20)...'
+                    ? 'Ketik kode atau kata kunci dari template (mis. 20 atau Keuangan)...'
                     : 'Ketik kode lokasi simpan lama secara langsung (mis. 201)...'
                 }
                 className="w-full rounded-lg border border-slate-300 bg-white py-2.5 pr-4 pl-10 font-mono text-sm text-slate-900 placeholder:font-sans placeholder:text-slate-400 focus:border-[#0F4C81] focus:ring-2 focus:ring-[#0F4C81]/20 focus:outline-none"
@@ -416,49 +448,113 @@ export const BoxInputModal: React.FC<BoxInputModalProps> = ({
               </div>
             )}
 
-            {/* Autocomplete List from Imported Spreadsheet */}
-            {state.spreadsheet && showSuggestions && suggestions.length > 0 && (
+            {/* Autocomplete List from Imported Spreadsheet (Locked codes hidden by default) */}
+            {state.spreadsheet && showSuggestions && (
+              <div className="mt-2.5">
+                {totalLockedInTemplate > 0 && (
+                  <div className="mb-1.5 flex flex-wrap items-center justify-between gap-2 text-[11px] text-slate-500">
+                    <span className="inline-flex items-center gap-1 tabular-nums">
+                      <Lock className="h-3 w-3 text-amber-600" />
+                      {totalLockedInTemplate} kode sudah digunakan & terkunci
+                    </span>
+                    <label className="inline-flex cursor-pointer items-center gap-1.5 font-medium text-slate-600 select-none">
+                      <input
+                        type="checkbox"
+                        checked={showLockedInSearch}
+                        onChange={(e) => setShowLockedInSearch(e.target.checked)}
+                        data-testid="toggle-show-locked-search"
+                        className="h-3 w-3 rounded border-slate-300 text-[#0F4C81] focus:ring-[#0F4C81]"
+                      />
+                      <span>Tampilkan kode terkunci</span>
+                    </label>
+                  </div>
+                )}
+
+                {suggestions.length > 0 && (
+                  <div
+                    role="listbox"
+                    aria-label="Daftar lokasi simpan lama dari spreadsheet"
+                    className="max-h-48 divide-y divide-slate-100 overflow-y-auto rounded-lg border border-slate-200 bg-white"
+                  >
+                    {suggestions.map((item, idx) => {
+                      const locked = lockedLookup.get(item.normalizedKey);
+                      const isActive = idx === activeSuggestionIdx && !locked;
+                      return (
+                        <button
+                          key={`${item.normalizedKey}-${item.rowNumber}`}
+                          type="button"
+                          role="option"
+                          disabled={Boolean(locked)}
+                          aria-selected={isActive}
+                          aria-disabled={Boolean(locked)}
+                          data-testid={`suggestion-item-${item.oldLocation}`}
+                          onClick={() => handleSelectSuggestion(item)}
+                          className={`flex w-full items-center justify-between gap-3 px-3.5 py-2 text-left text-sm transition-colors ${
+                            locked
+                              ? 'cursor-not-allowed bg-slate-50/90 opacity-75'
+                              : isActive
+                                ? 'bg-sky-50'
+                                : 'hover:bg-slate-50'
+                          }`}
+                        >
+                          <div className="min-w-0">
+                            <span
+                              className={`font-mono font-semibold tabular-nums ${
+                                locked
+                                  ? 'text-slate-400 line-through'
+                                  : 'text-slate-900'
+                              }`}
+                            >
+                              {item.oldLocation}
+                            </span>
+                            {item.description && (
+                              <span className="ml-2 text-xs text-slate-500">
+                                · {item.description}
+                              </span>
+                            )}
+                          </div>
+                          <span className="shrink-0 text-xs tabular-nums">
+                            {locked ? (
+                              <span className="inline-flex items-center gap-1 font-medium text-amber-800">
+                                <Lock className="h-3 w-3" />
+                                Terkunci → {locked.newLocation}
+                              </span>
+                            ) : (
+                              <span className="text-emerald-700">Tersedia</span>
+                            )}
+                          </span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Locked-Code Notice when Search Query Matches Already-Used Codes */}
+            {showLockedOnlyNotice && (
               <div
-                role="listbox"
-                aria-label="Daftar lokasi simpan lama dari spreadsheet"
-                className="mt-2 max-h-48 overflow-y-auto rounded-lg border border-slate-200 bg-white divide-y divide-slate-100"
+                role="status"
+                data-testid="locked-search-notice"
+                className="mt-2.5 flex items-start gap-2.5 rounded-lg border border-amber-200 bg-amber-50 px-3.5 py-2.5 text-xs text-amber-950"
               >
-                {suggestions.map((item, idx) => {
-                  const placed = placedLookup.get(item.normalizedKey);
-                  const isActive = idx === activeSuggestionIdx;
-                  return (
-                    <button
-                      key={`${item.normalizedKey}-${item.rowNumber}`}
-                      type="button"
-                      role="option"
-                      aria-selected={isActive}
-                      onClick={() => handleSelectSuggestion(item)}
-                      className={`flex w-full items-center justify-between gap-3 px-3.5 py-2 text-left text-sm transition-colors ${
-                        isActive ? 'bg-sky-50' : 'hover:bg-slate-50'
-                      }`}
-                    >
-                      <div className="min-w-0">
-                        <span className="font-mono font-semibold text-slate-900 tabular-nums">
-                          {item.oldLocation}
-                        </span>
-                        {item.description && (
-                          <span className="ml-2 text-xs text-slate-500">
-                            · {item.description}
-                          </span>
-                        )}
-                      </div>
-                      <span className="shrink-0 text-xs tabular-nums">
-                        {placed ? (
-                          <span className="font-medium text-amber-700">
-                            Sudah di {placed.newLocation}
-                          </span>
-                        ) : (
-                          <span className="text-emerald-700">Tersedia</span>
-                        )}
-                      </span>
-                    </button>
-                  );
-                })}
+                <Lock className="mt-0.5 h-4 w-4 shrink-0 text-amber-700" />
+                <div>
+                  <p className="font-semibold">
+                    Kode "{inputValue.trim()}" sudah digunakan & terkunci.
+                  </p>
+                  <p className="mt-0.5 text-amber-900">
+                    Hasil kecocokan disembunyikan dari pencarian karena telah
+                    dipindahkan menjadi:{' '}
+                    <span className="font-mono font-semibold">
+                      {matchedLockedItems
+                        .slice(0, 3)
+                        .map((m) => `${m.item.oldLocation} → ${m.lock.newLocation}`)
+                        .join(', ')}
+                    </span>
+                    .
+                  </p>
+                </div>
               </div>
             )}
 
@@ -466,19 +562,33 @@ export const BoxInputModal: React.FC<BoxInputModalProps> = ({
             {showNotFoundNotice && (
               <div
                 role="status"
-                className="mt-2.5 flex items-start gap-2.5 rounded-lg border border-amber-200 bg-amber-50 px-3.5 py-2.5 text-xs text-amber-900"
+                className="mt-2.5 flex flex-wrap items-start justify-between gap-2.5 rounded-lg border border-amber-200 bg-amber-50 px-3.5 py-2.5 text-xs text-amber-900"
               >
-                <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-600" />
-                <div>
-                  <p className="font-semibold">
-                    Data lokasi simpan lama "{inputValue.trim()}" tidak tersedia.
-                  </p>
-                  <p className="mt-0.5 text-amber-800">
-                    {state.allowUnlistedWithSpreadsheet
-                      ? 'Mode input di luar spreadsheet aktif. Anda tetap dapat memindahkan kode ini.'
-                      : 'Tidak ditemukan kecocokan pada spreadsheet yang diimpor. Periksa kode atau aktifkan izin input manual pada tab Impor Spreadsheet.'}
-                  </p>
+                <div className="flex items-start gap-2.5">
+                  <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-600" />
+                  <div>
+                    <p className="font-semibold">
+                      Data lokasi simpan lama &ldquo;{inputValue.trim()}&rdquo;
+                      tidak tersedia.
+                    </p>
+                    <p className="mt-0.5 text-amber-800">
+                      {state.allowUnlistedWithSpreadsheet
+                        ? 'Mode input di luar spreadsheet aktif. Anda tetap dapat memindahkan kode ini.'
+                        : 'Tidak ditemukan kecocokan pada template. Anda dapat langsung menambahkannya ke template di sini.'}
+                    </p>
+                  </div>
                 </div>
+                {onQuickAddToTemplate && inputValue.trim() && (
+                  <button
+                    type="button"
+                    data-testid="modal-quick-add-template-btn"
+                    onClick={() => onQuickAddToTemplate(inputValue.trim())}
+                    className="inline-flex items-center gap-1 rounded-md border border-[#0F4C81]/30 bg-white px-2.5 py-1.5 text-[11px] font-semibold text-[#0F4C81] transition-colors hover:bg-sky-50 whitespace-nowrap shrink-0"
+                  >
+                    <Plus className="h-3 w-3" />
+                    Tambah &ldquo;{inputValue.trim()}&rdquo; ke Template
+                  </button>
+                )}
               </div>
             )}
 
@@ -488,7 +598,8 @@ export const BoxInputModal: React.FC<BoxInputModalProps> = ({
                 liveValidation.status === 'same_value_in_box' ||
                 liveValidation.status === 'empty' ||
                 (liveValidation.status === 'not_in_spreadsheet' &&
-                  !showNotFoundNotice)) && (
+                  !showNotFoundNotice &&
+                  (submitAttempted || suggestions.length === 0))) && (
                 <div
                   role="alert"
                   className="mt-3 flex items-start justify-between gap-3 rounded-lg border border-red-200 bg-red-50 px-3.5 py-2.5 text-xs text-red-800"
@@ -497,28 +608,29 @@ export const BoxInputModal: React.FC<BoxInputModalProps> = ({
                     <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-red-600" />
                     <p className="leading-relaxed">{liveValidation.message}</p>
                   </div>
-                  {liveValidation.status === 'duplicate_old_location' && (
-                    <button
-                      type="button"
-                      onClick={() => {
-                        const existing = getPlacementByOldLocation(
-                          getAllTrackedPlacements(state),
-                          inputValue
-                        );
-                        if (existing) {
+                  {liveValidation.status === 'duplicate_old_location' && (() => {
+                    const existing = getPlacementByOldLocation(
+                      getEffectiveRackPlacements(state),
+                      inputValue
+                    );
+                    if (!existing) return null;
+                    return (
+                      <button
+                        type="button"
+                        onClick={() => {
                           onJumpToBox({
                             locationCode: existing.locationCode,
                             rack: existing.rack,
                             row: existing.row,
                             box: existing.box,
                           });
-                        }
-                      }}
-                      className="shrink-0 font-semibold text-red-900 underline hover:text-red-700 whitespace-nowrap"
-                    >
-                      Buka Box
-                    </button>
-                  )}
+                        }}
+                        className="shrink-0 font-semibold text-red-900 underline hover:text-red-700 whitespace-nowrap"
+                      >
+                        Buka Box
+                      </button>
+                    );
+                  })()}
                 </div>
               )}
 

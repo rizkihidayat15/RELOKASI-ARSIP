@@ -2,5 +2,7 @@
   "name": "Simulasi Relokasi Lokasi Simpan Arsip",
   "description": "Aplikasi simulasi pemindahan lokasi simpan arsip lama ke format baru langsung melalui visualisasi rak interaktif dengan impor spreadsheet dan ekspor Excel.",
   "requestFramePermissions": [],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
 }

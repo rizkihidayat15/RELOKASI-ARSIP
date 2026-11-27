@@ -11,14 +11,21 @@ import {
   detectBestLocationColumn,
   extractSpreadsheetItems,
   formatNewLocationCode,
+  getCombinedResultRecords,
+  getEffectiveRackPlacements,
+  getLockedLocationsMap,
+  parseExternalSheetLocks,
+  parseNewLocationCode,
   removeDraftByCoordinate,
+  removePlacementByCoordinate,
   removeSavedRecordById,
   resetActiveRackSimulation,
   searchOldLocations,
+  searchOldLocationsWithLockStatus,
   undoLastAction,
   validatePlacementInput,
 } from './relocationEngine';
-import type { ImportedSpreadsheet } from '../types/archive';
+import type { ImportedSpreadsheet, SimulationState } from '../types/archive';
 
 function createSampleSpreadsheet(): ImportedSpreadsheet {
   const rawRows = [
@@ -265,3 +272,196 @@ test('detectBestLocationColumn prioritizes old location header names', () => {
   );
   assert.equal(detectBestLocationColumn(['Kode', 'Nama']), 'Kode');
 });
+
+test('locked old locations from simulation results and Google Sheets are hidden from default search and blocked on submit', () => {
+  const spreadsheet = createSampleSpreadsheet();
+  const sheetLocks = parseExternalSheetLocks([
+    ['FORMAT LAMA', 'FORMAT BARU'],
+    ['202', 'RC2.5.1.12'],
+  ]);
+
+  let state: SimulationState = {
+    ...createInitialSimulationState(),
+    spreadsheet,
+    externalLockedLocations: sheetLocks,
+  };
+
+  // Relocate 201 and commit to saved results
+  state = applyPlacement(
+    state,
+    { locationCode: 'RC2', rack: 1, row: 1, box: 1 },
+    '201'
+  ).nextState;
+  state = commitDraftToExcel(state).nextState;
+  state = resetActiveRackSimulation(state);
+
+  const lockedMap = getLockedLocationsMap(state);
+  assert.equal(lockedMap.get('201')?.newLocation, 'RC2.1.1.1');
+  assert.equal(lockedMap.get('202')?.newLocation, 'RC2.5.1.12');
+  assert.equal(lockedMap.get('202')?.source, 'google_sheets');
+
+  // Default search (hideLocked: true) for '20' hides 201 and 202, leaving only 205
+  const hiddenSearch = searchOldLocationsWithLockStatus(
+    spreadsheet,
+    lockedMap,
+    '20',
+    { hideLocked: true }
+  );
+  assert.deepEqual(
+    hiddenSearch.visibleItems.map((i) => i.oldLocation),
+    ['205']
+  );
+  assert.equal(hiddenSearch.matchedLockedItems.length, 2);
+
+  // Searching directly for locked code '201' returns 0 visible available items but 1 matchedLockedItem
+  const exactLockedSearch = searchOldLocationsWithLockStatus(
+    spreadsheet,
+    lockedMap,
+    '201',
+    { hideLocked: true }
+  );
+  assert.equal(exactLockedSearch.visibleItems.length, 0);
+  assert.equal(exactLockedSearch.matchedLockedItems.length, 1);
+  assert.equal(exactLockedSearch.matchedLockedItems[0].lock.newLocation, 'RC2.1.1.1');
+
+  // Showing locked items (hideLocked: false) returns all 3 matches
+  const showLockedSearch = searchOldLocationsWithLockStatus(
+    spreadsheet,
+    lockedMap,
+    '20',
+    { hideLocked: false }
+  );
+  assert.deepEqual(
+    showLockedSearch.visibleItems.map((i) => i.oldLocation),
+    ['201', '202', '205']
+  );
+
+  // Submitting Google-Sheets-locked code '202' is rejected
+  const googleLockedValidation = validatePlacementInput(
+    state,
+    { locationCode: 'RC2', rack: 1, row: 1, box: 2 },
+    '202'
+  );
+  assert.equal(googleLockedValidation.status, 'duplicate_old_location');
+  if (googleLockedValidation.status === 'duplicate_old_location') {
+    assert.equal(googleLockedValidation.inGoogleSheets, true);
+    assert.equal(googleLockedValidation.lockedNewLocation, 'RC2.5.1.12');
+  }
+});
+
+test('dashboard metrics synchronize template progress against Spreadsheet Hasil (Google Sheets + local saved + active draft) without double counting', () => {
+  const spreadsheet = createSampleSpreadsheet(); // 4 items: 201, 202, 205, 310
+  // External spreadsheet already has 201 (also saved locally), 202 (only in external sheet), and 999 (outside template)
+  const externalLocks = parseExternalSheetLocks([
+    ['FORMAT LAMA', 'FORMAT BARU'],
+    ['201', 'RC2.1.1.1'],
+    ['202', 'RC2.4.2.15'],
+    ['999', 'RC2.9.1.1'],
+  ]);
+
+  let state: SimulationState = {
+    ...createInitialSimulationState(),
+    spreadsheet,
+    externalLockedLocations: externalLocks,
+  };
+
+  // Place 205 as unsaved draft on an empty box on the active rack (RC2.1.1.1 is already occupied by 201 in Tabel Hasil)
+  state = applyPlacement(
+    state,
+    { locationCode: 'RC2', rack: 1, row: 1, box: 2 },
+    '205'
+  ).nextState;
+
+  // Also have 201 in local savedRecords to verify deduplication against externalLocks
+  state = {
+    ...state,
+    savedRecords: [
+      {
+        id: 'saved-201',
+        oldLocation: '201',
+        newLocation: 'RC2.1.1.1',
+        locationCode: 'RC2',
+        rack: 1,
+        row: 1,
+        box: 9,
+        sequence: 1,
+        placedAt: '2026-01-01T00:00:00.000Z',
+        savedToExcel: true,
+      },
+    ],
+  };
+
+  const metrics = calculateSimulationMetrics(state, 'RC2', 1);
+  assert.equal(metrics.templateTotal, 4);
+  assert.equal(metrics.templateRegisteredCount, 2); // 201 & 202 registered in Spreadsheet Hasil
+  assert.equal(metrics.templateDraftOnlyCount, 1); // 205 in active rack draft only
+  assert.equal(metrics.templateSimulatedCount, 3); // 201, 202, 205
+  assert.equal(metrics.templateRemainingCount, 1); // 310 belum terdaftar / tersimulasi
+  assert.equal(metrics.unmatchedResultCount, 1); // 999 outside template
+  assert.equal(metrics.spreadsheetResultsTotal, 3); // 201, 202, 999 (deduplicated)
+  assert.equal(metrics.registeredProgressPercent, 50); // 2/4
+  assert.equal(metrics.draftProgressPercent, 25); // +1/4
+  assert.equal(metrics.progressPercent, 75); // 3/4
+});
+
+test('entries registered in Tabel Hasil (savedRecords or external sheets/Excel) immediately appear as simulated boxes on the rack', () => {
+  assert.deepEqual(parseNewLocationCode('RC2.3.2.15'), {
+    locationCode: 'RC2',
+    rack: 3,
+    row: 2,
+    box: 15,
+  });
+  assert.equal(parseNewLocationCode('INVALID'), null);
+
+  const externalLocks = parseExternalSheetLocks(
+    [
+      ['FORMAT LAMA', 'FORMAT BARU'],
+      ['201', 'RC2.1.1.1'],
+      ['202', 'RC2.1.1.2'],
+    ],
+    'external_file'
+  );
+
+  let state: SimulationState = {
+    ...createInitialSimulationState(),
+    spreadsheet: createSampleSpreadsheet(),
+    externalLockedLocations: externalLocks,
+  };
+
+  // Both rows from Tabel Hasil immediately show up in combined results AND as simulated boxes on Rak 1
+  const combined = getCombinedResultRecords(state);
+  assert.equal(combined.length, 2);
+  assert.deepEqual(
+    combined.map((r) => `${r.oldLocation}->${r.newLocation}`),
+    ['201->RC2.1.1.1', '202->RC2.1.1.2']
+  );
+
+  const rackPlacements = getEffectiveRackPlacements(state);
+  assert.equal(rackPlacements.length, 2);
+  assert.equal(rackPlacements.every((p) => p.savedToExcel === true), true);
+
+  // Active rack metrics reflect both simulated boxes immediately
+  const metrics = calculateSimulationMetrics(state, 'RC2', 1);
+  assert.equal(metrics.rackFilledBoxes, 2);
+  assert.equal(metrics.rackEmptyBoxes, 48);
+
+  // Attempting to place another code on RC2.1.1.1 asks for replace confirmation (cannot silently overwrite!)
+  const overwriteCheck = validatePlacementInput(
+    state,
+    { locationCode: 'RC2', rack: 1, row: 1, box: 1 },
+    '205'
+  );
+  assert.equal(overwriteCheck.status, 'needs_replace_confirmation');
+
+  // Deleting box RC2.1.1.1 frees both the box and old code 201
+  state = removePlacementByCoordinate(state, {
+    locationCode: 'RC2',
+    rack: 1,
+    row: 1,
+    box: 1,
+  });
+  assert.equal(getEffectiveRackPlacements(state).length, 1);
+  assert.equal(getCombinedResultRecords(state).length, 1);
+});
+
+

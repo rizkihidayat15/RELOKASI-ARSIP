@@ -524,7 +524,7 @@ export const RackVisualizer: React.FC<RackVisualizerProps> = ({
                 aria-hidden="true"
                 className="inline-block h-3 w-3 rounded border border-emerald-600 bg-emerald-50"
               />
-              Tersimpan di Excel
+              Sudah Tersimulasi (Tabel Hasil)
             </span>
           </div>
         </div>
@@ -615,7 +615,7 @@ export const RackVisualizer: React.FC<RackVisualizerProps> = ({
                       highlightedCoordinate.box === boxNum;
 
                     const accessibleLabel = isFilled
-                      ? `${cleanLocationCode} Rak ${activeRack} Row ${rowNum} Box ${boxNum}, Kode ${newCode}, Terisi lokasi lama ${placement!.oldLocation}${isSaved ? ', Tersimpan di Excel' : ', Belum disimpan'}`
+                      ? `${cleanLocationCode} Rak ${activeRack} Row ${rowNum} Box ${boxNum}, Kode ${newCode}, Terisi lokasi lama ${placement!.oldLocation}${isSaved ? ', Sudah Tersimulasi (Tabel Hasil)' : ', Draft belum disimpan'}`
                       : `${cleanLocationCode} Rak ${activeRack} Row ${rowNum} Box ${boxNum}, Kode ${newCode}, Kosong`;
 
                     return (

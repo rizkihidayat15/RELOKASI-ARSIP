@@ -13,6 +13,36 @@ import {
   EXPORT_EXCEL_FILENAME,
   type GeneratedExcelArtifact,
 } from '../utils/excelService';
+import type {
+  ConnectedGoogleSheet,
+  DriveSpreadsheetItem,
+} from '../utils/googleSheetsSync';
+import { GoogleSheetsSyncCard } from './GoogleSheetsSyncCard';
+
+export interface GoogleSheetsPanelProps {
+  isAuthenticated: boolean;
+  userEmail: string | null;
+  isSigningIn: boolean;
+  connectedSheet: ConnectedGoogleSheet | null;
+  driveFiles: DriveSpreadsheetItem[];
+  isLoadingDriveFiles: boolean;
+  isConnectingSheet: boolean;
+  isSyncing: boolean;
+  isRefreshingSheet: boolean;
+  syncError: string | null;
+  pendingSyncCount: number;
+  pendingNewCount: number;
+  pendingUpdateCount: number;
+  onSignIn: () => void;
+  onSignOut: () => void;
+  onConnectByUrl: (urlOrId: string) => Promise<boolean>;
+  onLoadDriveFiles: () => void;
+  onCreateNewSheet: () => void;
+  onSelectSheetTab: (sheetName: string) => void;
+  onDisconnectSheet: () => void;
+  onRefreshFromSheet: () => void;
+  onRequestSyncToGoogleSheet: () => void;
+}
 
 interface ResultsPanelProps {
   savedRecords: PlacementRecord[];
@@ -21,6 +51,7 @@ interface ResultsPanelProps {
   generatedArtifact: GeneratedExcelArtifact | null;
   isArtifactStale: boolean;
   fullWidth?: boolean;
+  googleSheets: GoogleSheetsPanelProps;
   onToggleExtraColumns: (checked: boolean) => void;
   onRemoveSavedRecord: (placementId: string) => void;
   onRequestClearSavedExcel: () => void;
@@ -36,6 +67,7 @@ export const ResultsPanel: React.FC<ResultsPanelProps> = ({
   generatedArtifact,
   isArtifactStale,
   fullWidth = false,
+  googleSheets,
   onToggleExtraColumns,
   onRemoveSavedRecord,
   onRequestClearSavedExcel,
@@ -61,6 +93,9 @@ export const ResultsPanel: React.FC<ResultsPanelProps> = ({
   }, [orderedRecords, tableSearch]);
 
   const hasData = savedRecords.length > 0;
+  const canDirectSyncSheets = Boolean(
+    googleSheets.isAuthenticated && googleSheets.connectedSheet
+  );
 
   return (
     <section
@@ -72,10 +107,11 @@ export const ResultsPanel: React.FC<ResultsPanelProps> = ({
         <div className="flex flex-wrap items-center justify-between gap-2">
           <div>
             <h2 className="text-base font-bold tracking-tight text-slate-900">
-              Hasil Simpan Excel
+              Hasil Simpan Spreadsheet
             </h2>
             <p className="mt-0.5 text-xs text-slate-500 tabular-nums">
-              Akumulasi antar siklus rak · {savedRecords.length} baris tersimpan
+              Akumulasi antar siklus rak · {savedRecords.length} baris terdaftar
+              (sudah tersimulasi)
             </p>
           </div>
           {hasData ? (
@@ -84,7 +120,7 @@ export const ResultsPanel: React.FC<ResultsPanelProps> = ({
               onClick={onRequestClearSavedExcel}
               className="text-xs font-medium text-red-600 hover:text-red-700 hover:underline whitespace-nowrap shrink-0"
             >
-              Kosongkan Excel
+              Kosongkan Daftar
             </button>
           ) : (
             <span className="font-mono text-xs text-slate-500">
@@ -104,32 +140,65 @@ export const ResultsPanel: React.FC<ResultsPanelProps> = ({
               <strong className="font-semibold tabular-nums">
                 {unsavedDraftCount} box
               </strong>{' '}
-              pada simulasi rak aktif belum masuk Excel. Klik tombol{' '}
+              pada simulasi rak aktif belum masuk daftar. Klik tombol{' '}
               <strong className="font-semibold">Simpan</strong> untuk
-              menambahkannya ke daftar ini.
+              menambahkannya.
             </span>
           </div>
         )}
 
-        {/* Export Action Bar */}
-        <div className="mt-3.5 flex flex-wrap items-center gap-2">
+        {/* Google Drive / Google Sheets Same-Link Sync Panel */}
+        <GoogleSheetsSyncCard
+          isAuthenticated={googleSheets.isAuthenticated}
+          userEmail={googleSheets.userEmail}
+          isSigningIn={googleSheets.isSigningIn}
+          connectedSheet={googleSheets.connectedSheet}
+          driveFiles={googleSheets.driveFiles}
+          isLoadingDriveFiles={googleSheets.isLoadingDriveFiles}
+          isConnectingSheet={googleSheets.isConnectingSheet}
+          isSyncing={googleSheets.isSyncing}
+          isRefreshingSheet={googleSheets.isRefreshingSheet}
+          syncError={googleSheets.syncError}
+          savedRecordCount={savedRecords.length}
+          pendingSyncCount={googleSheets.pendingSyncCount}
+          pendingNewCount={googleSheets.pendingNewCount}
+          pendingUpdateCount={googleSheets.pendingUpdateCount}
+          onSignIn={googleSheets.onSignIn}
+          onSignOut={googleSheets.onSignOut}
+          onConnectByUrl={googleSheets.onConnectByUrl}
+          onLoadDriveFiles={googleSheets.onLoadDriveFiles}
+          onCreateNewSheet={googleSheets.onCreateNewSheet}
+          onSelectSheetTab={googleSheets.onSelectSheetTab}
+          onDisconnectSheet={googleSheets.onDisconnectSheet}
+          onRefreshFromSheet={googleSheets.onRefreshFromSheet}
+          onRequestSyncToGoogleSheet={googleSheets.onRequestSyncToGoogleSheet}
+        />
+
+        {/* Local Excel Fallback Action Bar */}
+        <div className="mt-3 flex flex-wrap items-center gap-2">
           <button
             type="button"
             disabled={!hasData}
-            onClick={onGenerateExcel}
-            className="inline-flex items-center gap-1.5 rounded-lg border border-slate-300 bg-white px-3.5 py-2 text-xs font-semibold text-slate-800 transition-colors hover:bg-slate-50 disabled:opacity-45 whitespace-nowrap shrink-0"
+            onClick={
+              canDirectSyncSheets
+                ? googleSheets.onRequestSyncToGoogleSheet
+                : onGenerateExcel
+            }
+            className="inline-flex items-center gap-1.5 rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs font-semibold text-slate-800 transition-colors hover:bg-slate-50 disabled:opacity-45 whitespace-nowrap shrink-0"
           >
             <FileSpreadsheet className="h-3.5 w-3.5 text-[#0F4C81]" />
-            Generate Excel
+            {canDirectSyncSheets
+              ? 'Generate & Update Sheets'
+              : 'Generate Excel'}
           </button>
           <button
             type="button"
             disabled={!hasData}
             onClick={onDownloadExcel}
-            className="inline-flex items-center gap-1.5 rounded-lg bg-[#0F4C81] px-3.5 py-2 text-xs font-semibold text-white transition-colors hover:bg-[#0B3A63] disabled:opacity-45 whitespace-nowrap shrink-0"
+            className="inline-flex items-center gap-1.5 rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs font-semibold text-slate-700 transition-colors hover:bg-slate-50 disabled:opacity-45 whitespace-nowrap shrink-0"
           >
             <Download className="h-3.5 w-3.5" />
-            Download Excel
+            Unduh .xlsx
           </button>
         </div>
 
@@ -190,7 +259,7 @@ export const ResultsPanel: React.FC<ResultsPanelProps> = ({
               type="text"
               value={tableSearch}
               onChange={(e) => setTableSearch(e.target.value)}
-              aria-label="Filter tabel hasil simpan Excel"
+              aria-label="Filter tabel hasil simpan spreadsheet"
               placeholder="Filter FORMAT LAMA atau FORMAT BARU..."
               className="w-full rounded-lg border border-slate-200 bg-slate-50 py-1.5 pr-3 pl-8 text-xs text-slate-900 placeholder:text-slate-400 focus:border-[#0F4C81] focus:bg-white focus:outline-none"
             />
@@ -290,22 +359,24 @@ export const ResultsPanel: React.FC<ResultsPanelProps> = ({
                     )}
                     <td className="px-3 py-2.5 text-right">
                       <div className="inline-flex items-center justify-end gap-1">
-                        <button
-                          type="button"
-                          onClick={() =>
-                            onJumpToBox({
-                              locationCode: item.locationCode,
-                              rack: item.rack,
-                              row: item.row,
-                              box: item.box,
-                            })
-                          }
-                          aria-label={`Lihat lokasi ${item.oldLocation} di ${item.newLocation}`}
-                          title="Tampilkan rak lokasi ini"
-                          className="rounded p-1 text-slate-400 transition-colors hover:bg-slate-100 hover:text-[#0F4C81]"
-                        >
-                          <MapPin className="h-3.5 w-3.5" />
-                        </button>
+                        {item.rack >= 1 && item.row >= 1 && item.box >= 1 && (
+                          <button
+                            type="button"
+                            onClick={() =>
+                              onJumpToBox({
+                                locationCode: item.locationCode,
+                                rack: item.rack,
+                                row: item.row,
+                                box: item.box,
+                              })
+                            }
+                            aria-label={`Lihat lokasi ${item.oldLocation} di ${item.newLocation}`}
+                            title="Tampilkan rak lokasi ini"
+                            className="rounded p-1 text-slate-400 transition-colors hover:bg-slate-100 hover:text-[#0F4C81]"
+                          >
+                            <MapPin className="h-3.5 w-3.5" />
+                          </button>
+                        )}
                         <button
                           type="button"
                           onClick={() => onRemoveSavedRecord(item.id)}
